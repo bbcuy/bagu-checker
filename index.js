@@ -1,5 +1,5 @@
 // ============================================================
-//  八股审查脚本 v0.1 — SillyTavern / TavernHelper
+//  八股审查脚本 v0.2 — SillyTavern / TavernHelper
 //  按钮：八股检查 / 目标楼层 / ↩ 撤销 / ⚙ 检查设置 / 📋 控制台
 // ============================================================
 
@@ -51,6 +51,10 @@ const BAGU_DEFAULT_PROMPT = `你是专业的中文创意写作审查员。对给
 - 无修改则输出：[]
 - original 必须与正文完全一致，否则替换失效。
 - corrected 为 "" 表示删除该句。`;
+
+
+// ── ①b 强制停止状态 ──────────────────────────────────────────────
+let _baguAbort = { reject: null, genId: null, running: false };
 
 // ── ② 日志系统 ──────────────────────────────────────────────────
 const _BLOGS = [];
@@ -302,11 +306,27 @@ async function baguCallAPI(text, msgId, cfg, sysprompt, msgSuffix, userRequest) 
     baguLog('log', `酒馆当前 API | model=${cfg.model||'(当前)'} | 正文${text.length}字 | 上下文${ctx.length}字`);
   }
 
+  // 超时 Promise
   const timeoutP = new Promise((_, rej) =>
     setTimeout(() => { stopGenerationById(genId); rej(new Error(`请求超时 (${cfg.timeoutMs/1000}秒)`)); }, cfg.timeoutMs)
   );
 
-  const result = await Promise.race([generateRaw(genCfg), timeoutP]);
+  // 强制停止 Promise（供三连点击触发）
+  const abortP = new Promise((_, rej) => {
+    _baguAbort.reject = rej;
+    _baguAbort.genId  = genId;
+    _baguAbort.running = true;
+  });
+
+  let result;
+  try {
+    result = await Promise.race([generateRaw(genCfg), timeoutP, abortP]);
+  } finally {
+    // 无论成功/失败/中止，都清理 abort 状态
+    _baguAbort.reject  = null;
+    _baguAbort.genId   = null;
+    _baguAbort.running = false;
+  }
 
   if (!result) {
     baguLog('warn', 'generateRaw 返回为空，可能 AI 无输出或被拦截');
@@ -483,10 +503,62 @@ async function baguRun(overrideMsgId = null, userRequest = null, noBackup = fals
     baguStatus(`✓ 楼层 #${msgId} 已修改 ${n} 处`, 'ok', true);
   } catch (e) {
     baguHideProgress(prog);
+    if (e?._isForceStop) {
+      baguLog('warn', `楼层 #${msgId} 检查被用户强制停止`);
+      baguShowStopBadge();
+      baguStatus('⛔ 检查已被用户强制停止', 'error');
+      return;
+    }
     baguLog('error', `检查失败: ${e.message ?? e}`);
     baguShowErrBadge(`API 错误：${(e.message ?? String(e)).slice(0, 200)}`);
     baguStatus(`✕ 失败: ${(e.message ?? String(e)).slice(0,60)} → 点📋控制台查看详情`, 'error');
   }
+}
+
+// ── ⑨b 强制停止检查 ────────────────────────────────────────────────
+function baguForceStop() {
+  if (!_baguAbort.running || !_baguAbort.reject) {
+    baguLog('warn', '当前没有正在运行的检查，无需停止');
+    return;
+  }
+  const genId = _baguAbort.genId;
+  // 终止 AI 生成
+  try { if (genId) stopGenerationById(genId); } catch {}
+  // 触发 reject → baguRun catch
+  const abortErr = new Error('USER_FORCE_STOP');
+  abortErr._isForceStop = true;
+  _baguAbort.reject(abortErr);
+  baguLog('warn', `用户三连点击强制停止检查 (genId=${genId})`);
+}
+
+function baguShowStopBadge() {
+  const pdoc = window.parent.document;
+  pdoc.getElementById('bagu-stop-badge')?.remove();
+  const wrap = pdoc.createElement('div');
+  wrap.id = 'bagu-stop-badge';
+  wrap.style.cssText = [
+    'position:fixed','top:10px','left:10px','z-index:2147483647',
+    'display:flex','align-items:center','gap:8px',
+    'background:rgba(60,15,15,.95)','border:2px solid #f38ba8',
+    'border-radius:20px','padding:8px 18px 8px 12px',
+    'font-size:14px','font-family:sans-serif','color:#f38ba8','font-weight:800',
+    'backdrop-filter:blur(6px)',
+    'box-shadow:0 0 18px rgba(243,139,168,.55), inset 0 0 8px rgba(243,139,168,.15)',
+    'transition:opacity .5s','cursor:pointer',
+    'animation:bagu-stop-pulse 1.2s ease-in-out',
+  ].join(';');
+  // 脉冲动画样式
+  if (!pdoc.getElementById('bagu-stop-kf')) {
+    const kf = pdoc.createElement('style');
+    kf.id = 'bagu-stop-kf';
+    kf.textContent = '@keyframes bagu-stop-pulse{0%{transform:scale(.8);opacity:0}30%{transform:scale(1.08);opacity:1}50%{transform:scale(.96)}100%{transform:scale(1);opacity:1}}';
+    pdoc.head.appendChild(kf);
+  }
+  wrap.title = '点击关闭';
+  wrap.innerHTML = '<span style="font-size:18px;line-height:1;flex-shrink:0;">⛔</span><span>用户停止检查</span>';
+  pdoc.documentElement.appendChild(wrap);
+  wrap.addEventListener('click', () => wrap.remove());
+  setTimeout(() => { wrap.style.opacity = '0'; setTimeout(() => wrap.remove(), 600); }, 6000);
 }
 
 // ── ⑩ 状态栏 ──────────────────────────────────────────────────────
@@ -1120,8 +1192,35 @@ $(errorCatched(async () => {
   core.addEventListener('mousedown', e => { startDrag(e.clientX, e.clientY); e.preventDefault(); });
   pdoc.addEventListener('mousemove', e => moveDrag(e.clientX, e.clientY));
   pdoc.addEventListener('mouseup', () => endDrag());
+  // ── 三连点击「八」强制停止检查 ──
+  let _tripleClicks = 0, _tripleTimer = null;
   core.addEventListener('click', e => {
-    e.stopPropagation(); if (moved) { moved = false; return; } toggle();
+    e.stopPropagation();
+    if (moved) { moved = false; return; }
+    _tripleClicks++;
+    if (_tripleClicks === 1) {
+      _tripleTimer = setTimeout(() => { _tripleClicks = 0; toggle(); }, 400);
+    } else if (_tripleClicks === 2) {
+      // 双击：不做事，等第三击
+    } else if (_tripleClicks >= 3) {
+      clearTimeout(_tripleTimer); _tripleClicks = 0;
+      if (_baguAbort.running) {
+        baguForceStop();
+        if (isOpen) closeM();
+      } else {
+        // 没有正在运行的检查，正常 toggle
+        toggle();
+      }
+    }
+    // 400ms 内没达到三击则重置
+    if (_tripleClicks === 2) {
+      clearTimeout(_tripleTimer);
+      _tripleTimer = setTimeout(() => {
+        // 双击超时 → 当作单击处理
+        _tripleClicks = 0;
+        toggle();
+      }, 400);
+    }
   });
   core.addEventListener('touchstart', e => {
     startDrag(e.touches[0].clientX, e.touches[0].clientY);
@@ -1129,9 +1228,27 @@ $(errorCatched(async () => {
   core.addEventListener('touchmove', e => {
     if (drag) moveDrag(e.touches[0].clientX, e.touches[0].clientY);
   }, { passive: true });
+  // ── 三连触摸「八」强制停止检查（移动端）──
+  let _tripleTaps = 0, _tripleTapTimer = null;
   core.addEventListener('touchend', e => {
     const wasMoved = moved; endDrag();
-    if (!wasMoved) { e.preventDefault(); e.stopPropagation(); toggle(); }
+    if (wasMoved) return;
+    e.preventDefault(); e.stopPropagation();
+    _tripleTaps++;
+    if (_tripleTaps === 1) {
+      _tripleTapTimer = setTimeout(() => { _tripleTaps = 0; toggle(); }, 400);
+    } else if (_tripleTaps === 2) {
+      clearTimeout(_tripleTapTimer);
+      _tripleTapTimer = setTimeout(() => { _tripleTaps = 0; toggle(); }, 400);
+    } else if (_tripleTaps >= 3) {
+      clearTimeout(_tripleTapTimer); _tripleTaps = 0;
+      if (_baguAbort.running) {
+        baguForceStop();
+        if (isOpen) closeM();
+      } else {
+        toggle();
+      }
+    }
   }, { passive: false });
 
   // 点外部关闭
@@ -1192,4 +1309,4 @@ eventOn(tavern_events.MESSAGE_RECEIVED, async () => {
   await baguRun(latestId, null, false);
 });
 
-baguLog('log', 'v0.1 已加载 | 悬浮球模式：点击右下角圆球展开菜单');
+baguLog('log', 'v0.2 已加载 | 悬浮球模式：点击右下角圆球展开菜单');
